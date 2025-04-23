@@ -301,7 +301,7 @@ class FlowNetwork:
 		in_coords_array = np.array(self.in_coords)  # shape (I, 2)
 		out_coords_array = np.array(self.out_coords)  # shape (O, 2)
 
-		distances = self.pairwise_haversine(out_coords_array, in_coords_array)  # shape (O, I)
+		distances = self._pairwise_haversine(out_coords_array, in_coords_array)  # shape (O, I)
 		distances[distances == 0] = np.nan  # prevent divide-by-zero
 
 		# Calculate gravity matrix g = G * m_o * m_i / d
@@ -461,71 +461,24 @@ class FlowNetwork:
 			ha='center', fontsize=10)
 		plt.show()
 
-	def compute_country_trade(self, out_path=None, verbose=False):
+	def compute_marginal_country_trade(self, out_path=None, verbose=False):
 		"""
 		Add estimated imports and exports to self.ds by comparing edge flows between different countries.
 		Requires static_ctry_frac_ds with shape (lat, lon), one data_var per country.
 		"""
 		if verbose:
 			print("Computing country trade from network flows...")
-		import os
-		ctry_frac_path = os.path.join(ssm.__path__[0],'data','country_fraction.1deg.2000-2023.a.nc')
-		ctry_frac_ds = xr.load_dataset(ctry_frac_path)
-		static_ctry_frac_ds = ctry_frac_ds.sel(time='2000').squeeze(drop=True)
 
-		# Initialize import/export arrays
-		shape = self.ds[self.inflow_var].shape
-		imports = np.zeros(shape)
-		exports = np.zeros(shape)
+		df = ssm.grid_2_table(dataset=self.ds, variables=[self.inflow_var, self.outflow_var], agg_function='sum', verbose=verbose)
+		#df = ssm.grid_2_table(dataset=self.ds, variables=self.outflow_var, agg_function='sum', verbose=verbose)
+		#df = df.merge(df, on='ISO3')
+		print(df)
 
-		# Precompute dominant country per grid cell (for performance)
-		ctry_stack = static_ctry_frac_ds.to_array(dim="country")  # shape: (country, lat, lon)
-		dominant_country_idx = ctry_stack.argmax(dim="country")
-		dominant_country = ctry_stack.country[dominant_country_idx]
 
-		# Convert to dict of (lat, lon) -> country string
-		lat_vals = static_ctry_frac_ds.lat.values
-		lon_vals = static_ctry_frac_ds.lon.values
-		country_map = {
-			(float(lat), float(lon)): str(dominant_country.sel(lat=lat, lon=lon).values)
-			for lat in lat_vals for lon in lon_vals
-		}
+		df['estimated_imports'] = np.maximum(0, df[self.inflow_var] - df[self.outflow_var])
+		df['estimated_exports'] = np.maximum(0, df[self.outflow_var] - df[self.inflow_var])
 
-		# Iterate through edges
-		total_out = len(self.out_coords)
-		for i, out_coord in enumerate(self.out_coords):
-			if verbose:
-				print(f"progress: {i/total_out*100:.2f}%")
-			for j, in_coord in enumerate(self.in_coords):
-				flow_val = self.flow[i, j]
-				if flow_val <= 0:
-					continue
-
-				# Ensure we only consider different countries
-				out_country = country_map.get(tuple(map(float, out_coord)), None)
-				in_country = country_map.get(tuple(map(float, in_coord)), None)
-
-				if out_country and in_country and out_country != in_country:
-					# Find indices of coords in ds
-					lat_in, lon_in = in_coord
-					lat_out, lon_out = out_coord
-
-					# Find nearest index in dataset
-					lat_in_idx = np.argmin(np.abs(self.ds.lat.values - lat_in))
-					lon_in_idx = np.argmin(np.abs(self.ds.lon.values - lon_in))
-					lat_out_idx = np.argmin(np.abs(self.ds.lat.values - lat_out))
-					lon_out_idx = np.argmin(np.abs(self.ds.lon.values - lon_out))
-
-					imports[lat_in_idx, lon_in_idx] += flow_val
-					exports[lat_out_idx, lon_out_idx] += flow_val
-
-		# Add the results to the dataset
-		self.ds["estimated_imports"] = (("lat", "lon"), imports)
-		self.ds["estimated_exports"] = (("lat", "lon"), exports)
-
-		df1 = ssm.grid_2_table(dataset=self.ds, variables="estimated_imports", agg_function='sum')
-		df2 = ssm.grid_2_table(dataset=self.ds, variables="estimated_imports", agg_function='sum')
-		self.predicted_marginal_df = pd.merge(df1,df2,on='ISO3')
+		self.predicted_marginal_df = df
 		if out_path:
 			self.predicted_marginal_df.to_csv(out_path)
 			if verbose:
