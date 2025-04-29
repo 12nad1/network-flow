@@ -4,6 +4,8 @@ import xarray as xr
 import matplotlib.pyplot as plt
 import seaborn as sns
 import cartopy.crs as ccrs
+import json
+import importlib.resources as pkg_resources
 import os
 import sesame as ssm
 
@@ -19,6 +21,9 @@ class FlowNetwork:
 			self.ds = self.ds.sel(time=time).squeeze(drop=True)
 		self.inflow_var = inflow_var
 		self.outflow_var = outflow_var
+		
+		country_frac_path = pkg_resources.files(ssm).joinpath("data/country_fraction.1deg.2000-2023.a.nc")
+		self.ds_country = xr.open_dataset(country_frac_path)
 
 		try:
 			assert(self.ds[self.outflow_var].sum().values == self.ds[self.inflow_var].sum().values)
@@ -402,7 +407,92 @@ class FlowNetwork:
 		self.flow = W
 		if verbose:
 			print(f"IPF complete. Flow matrix generated with {np.sum(self.flow > 0)} edges.")
-	
+
+	### Summarize and validate model #####
+	def _get_node_iso3s(self, year):
+		# slice once
+		ts = np.datetime64(f"{year}-01-01")
+		ds_slice = self.ds_country.sel(time=ts)
+		# stack once
+		da_iso3 = ds_slice.to_array(dim="ISO3")
+
+		def _pick(lat, lon):
+			return da_iso3.sel(lat=lat, lon=lon, method="nearest")\
+						.idxmax(dim="ISO3").item()
+
+		exp_iso3 = [ _pick(lat, lon) for lat, lon in self.out_coords]
+		imp_iso3 = [ _pick(lat, lon) for lat, lon in self.in_coords]
+		
+		# find all non-zero entries in the flow matrix
+		out_idx, in_idx = np.nonzero(self.flow)
+
+		# assemble records
+		records = []
+		for o, i in zip(out_idx, in_idx):
+			records.append({
+				"exporter": exp_iso3[o],
+				"importer": imp_iso3[i],
+				"flow":     self.flow[o, i],
+				"year":     year
+			})
+
+		# 4) return the edge‐list DataFrame
+		return pd.DataFrame(records)
+
+	def _group_iso3(self, json_path, trade_df):
+		with open(json_path, 'r') as f:
+			country_to_grouped_region = json.load(f)
+
+			# Map exporters and importers to their grouped‐region codes
+			trade_df['exp_ISO3'] = trade_df['exporter'].map(country_to_grouped_region)
+			trade_df['imp_ISO3'] = trade_df['importer'].map(country_to_grouped_region)
+
+			# Now aggregate total_flow by (exp_region, imp_region, year)
+			grouped_df = (
+				trade_df
+				.groupby(['exp_ISO3', 'imp_ISO3', 'year'], as_index=False)['total_flow']
+				.sum()
+				.rename(columns={'total_flow': 'tonnes'})
+			)
+			return grouped_df
+
+	def bilateral_flow(self, year, json_path=None):
+		edge_df = self._get_node_iso3s(year)
+		trade_df = (edge_df.groupby(["exporter", "importer", "year"], as_index=False)["flow"].sum().rename(columns={"flow": "total_flow"}))
+		if json_path:
+			trade_df = self._group_iso3(json_path, trade_df)
+		self.bilateral_df = trade_df.copy()
+
+	def validate_bilateral(self, bilateral_csv_path, year, x_log=False, y_log=False, rm_outliers=False):
+
+		raw_df = pd.read_csv(bilateral_csv_path)
+		if year:
+			raw_df = raw_df[raw_df["year"] == year]
+		
+		pred_df = self.bilateral_df
+		# 1) filter to the correct year
+		raw_y  = raw_df[raw_df.year == year ].copy().rename(columns={'tonnes':'raw_tonnes'})
+		pred_y = pred_df[pred_df.year == year].copy().rename(columns={'tonnes':'pred_tonnes'})
+
+		# 2) merge on exp_ISO3, imp_ISO3, year
+		val_df = pd.merge(
+			raw_y, pred_y,
+			on=['exp_ISO3','imp_ISO3','year'],
+			how='inner'
+		)
+		# 3) label for annotation
+		val_df['ISO3'] = val_df['exp_ISO3'] + '→' + val_df['imp_ISO3']
+
+		# 5) plot
+		self._limplot(
+			val_df,
+			x_col='raw_tonnes',
+			y_col='pred_tonnes',
+			x_log=x_log,
+			y_log=y_log,
+			rm_outliers=rm_outliers
+		)
+
 	def plot_network_map(self, caption=None, num_edges=None, vmin=None, vmax=None, color='coolwarm', levels=6, edge_thickness=1, edge_alpha=0.5, edge_color='gray'):
 		"""
 		Plot the flow network over a variable background map.
