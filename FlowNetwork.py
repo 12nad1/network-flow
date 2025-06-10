@@ -164,6 +164,17 @@ class FlowNetwork:
 		return flow_network
 
 	## Helper Functions ##
+	def _label_all_nodes(self, year):
+		ts = np.datetime64(f"{year}-01-01")
+		ds_slice = self.ds_country.sel(time=ts)
+		da_iso3 = ds_slice.to_array(dim="ISO3")
+
+		def _pick(lat, lon):
+			return da_iso3.sel(lat=lat, lon=lon, method="nearest").idxmax(dim="ISO3").item()
+
+		# Label nodes based on coordinates (efficient, direct)
+		self.out_iso3_dict = {coord: _pick(*coord) for coord in self.out_coords}
+		self.in_iso3_dict = {coord: _pick(*coord) for coord in self.in_coords}
 
 	def _coord_to_index(self, coord, kind='in'):
 		if kind == 'in':
@@ -202,13 +213,58 @@ class FlowNetwork:
 
 		return 6371 * c  # Earth's radius in km
 
+	def _create_tariff_matrix(mode):
+		print('TODO: Implement')
+
+	def _distance_scaled(dist, scale_matrix):
+		print('TODO: Implement')
+
+	def _distance_tariff(self, trade_tariff_path, year, tariff_weight_factor=1.0,
+						mode='exponential', alpha=1.0, a=2.0, b=10, c=0.3, verbose=False):
+		self._label_all_nodes(year)
+
+		tariff_df = pd.read_csv(trade_tariff_path)
+		tariff_df_year = tariff_df[tariff_df["year"] == year].copy()
+		max_tariff = tariff_df_year["tariff"].max()
+		tariff_df_year["normalized_tariff"] = tariff_df_year["tariff"] / max_tariff
+		tariff_dict = tariff_df_year.set_index(["iso2", "iso1"])["normalized_tariff"].to_dict()
+
+		in_coords_array = np.array(self.in_coords)
+		out_coords_array = np.array(self.out_coords)
+		distances = self._pairwise_haversine(out_coords_array, in_coords_array)
+		distances[distances == 0] = np.nan
+
+		tariff_matrix = np.zeros_like(distances)
+		for i, out_coord in enumerate(self.out_coords):
+			exporter = self.out_iso3_dict[out_coord]
+			for j, in_coord in enumerate(self.in_coords):
+				importer = self.in_iso3_dict[in_coord]
+				normalized_tariff = tariff_dict.get((exporter, importer), 1.0)
+				tariff_matrix[i, j] = normalized_tariff
+
+		if mode == 'linear':
+			adjusted_distances = distances * (1 + tariff_weight_factor * tariff_matrix)
+		elif mode == 'power':
+			adjusted_distances = distances * (1 + tariff_matrix) ** alpha
+		elif mode == 'sigmoid':
+			scale = 1 + a / (1 + np.exp(-b * (tariff_matrix - c)))
+			adjusted_distances = distances * scale
+		elif mode == 'piecewise':
+			penalty = np.where(tariff_matrix < 0.1, 1.0,
+					np.where(tariff_matrix < 0.3, 1.2, 1.6))
+			adjusted_distances = distances * penalty
+		else:  # default: exponential
+			adjusted_distances = distances * np.exp(tariff_weight_factor * tariff_matrix)
+
+		if verbose:
+			print(f"[{mode.upper()}] Mean adjusted distance: {np.nanmean(adjusted_distances):.2f}")
+
+		return adjusted_distances
+
 	def _limplot(self, df, x_col, y_col, x_log=False, y_log=False, rm_outliers=False):
-		# Drop rows with missing values in x, y, or ISO3
 		df_copy = df.dropna(subset=[x_col, y_col, "ISO3"]).copy()
 
-		# Prepare x axis values: if x_log is True, compute log10 and filter positive values only.
 		if x_log:
-			# Filter out non-positive values (log10 only works for positive numbers)
 			df_copy = df_copy[df_copy[x_col] > 0]
 			df_copy["x_plot"] = np.log10(df_copy[x_col])
 			x_label = f"log10({x_col})"
@@ -216,7 +272,6 @@ class FlowNetwork:
 			df_copy["x_plot"] = df_copy[x_col]
 			x_label = x_col
 
-		# Prepare y axis values: if y_log is True, compute log10 and filter positive values only.
 		if y_log:
 			df_copy = df_copy[df_copy[y_col] > 0]
 			df_copy["y_plot"] = np.log10(df_copy[y_col])
@@ -225,74 +280,83 @@ class FlowNetwork:
 			df_copy["y_plot"] = df_copy[y_col]
 			y_label = y_col
 
-		# Optionally remove outliers using the IQR method on the columns to be plotted (x_plot and y_plot)
 		if rm_outliers:
-			# For x_plot values
-			Q1_x = df_copy["x_plot"].quantile(0.25)
-			Q3_x = df_copy["x_plot"].quantile(0.75)
-			IQR_x = Q3_x - Q1_x
-			lower_bound_x = Q1_x - 1.5 * IQR_x
-			upper_bound_x = Q3_x + 1.5 * IQR_x
+			Q1_x, Q3_x = df_copy["x_plot"].quantile([0.25, 0.75])
+			Q1_y, Q3_y = df_copy["y_plot"].quantile([0.25, 0.75])
+			IQR_x, IQR_y = Q3_x - Q1_x, Q3_y - Q1_y
 
-			# For y_plot values
-			Q1_y = df_copy["y_plot"].quantile(0.25)
-			Q3_y = df_copy["y_plot"].quantile(0.75)
-			IQR_y = Q3_y - Q1_y
-			lower_bound_y = Q1_y - 1.5 * IQR_y
-			upper_bound_y = Q3_y + 1.5 * IQR_y
-
-			# Remove rows where x or y are outside their respective bounds
 			df_copy = df_copy[
-				(df_copy["x_plot"] >= lower_bound_x) & (df_copy["x_plot"] <= upper_bound_x) &
-				(df_copy["y_plot"] >= lower_bound_y) & (df_copy["y_plot"] <= upper_bound_y)
+				(df_copy["x_plot"] >= Q1_x - 1.5 * IQR_x) & (df_copy["x_plot"] <= Q3_x + 1.5 * IQR_x) &
+				(df_copy["y_plot"] >= Q1_y - 1.5 * IQR_y) & (df_copy["y_plot"] <= Q3_y + 1.5 * IQR_y)
 			]
-		
-		# Compute the R² value using a linear regression (fit on the x_plot and y_plot values)
+
 		x_vals = df_copy["x_plot"].values
 		y_vals = df_copy["y_plot"].values
-		if len(x_vals) > 1:  # Ensure there is more than one data point
+
+		if len(x_vals) > 1:
 			slope, intercept = np.polyfit(x_vals, y_vals, 1)
 			y_pred = slope * x_vals + intercept
-			r2 = 1 - np.sum((y_vals - y_pred)**2) / np.sum((y_vals - np.mean(y_vals))**2)
-		else:
-			r2 = np.nan
 
-		# Create the lmplot using the prepared (and optionally transformed) data
-		g = sns.lmplot(
-			x="x_plot", 
-			y="y_plot", 
-			data=df_copy,
-			scatter_kws={"alpha": 0.6, "s": 15},
-			line_kws={"color": "red"},
-			ci=95
+			# Metrics
+			r2 = 1 - np.sum((y_vals - y_pred)**2) / np.sum((y_vals - np.mean(y_vals))**2)
+			rmse = np.sqrt(np.mean((y_vals - x_vals)**2))
+			mae = np.mean(np.abs(y_vals - x_vals))
+			nrmse = rmse / np.mean(x_vals)
+			mape = np.mean(np.abs((y_vals - x_vals) / x_vals)) * 100
+			smape = np.mean(2 * np.abs(y_vals - x_vals) / (np.abs(x_vals) + np.abs(y_vals))) * 100
+		else:
+			r2 = rmse = mae = nrmse = mape = smape = np.nan
+
+		# Compute residuals and CI
+		residuals = y_vals - x_vals
+		std_residual = np.std(residuals)
+		ci = 1.96 * std_residual
+
+		# Define the 1:1 line
+		min_val = min(x_vals.min(), y_vals.min())
+		max_val = max(x_vals.max(), y_vals.max())
+		x_line = np.array([min_val, max_val])
+		y_line = x_line
+
+		# Plot
+		fig, ax = plt.subplots(figsize=(7, 6))
+		ax.scatter(x_vals, y_vals, alpha=0.6, s=25)
+		ax.plot(x_line, y_line, 'b--', label='1-to-1 line')
+		ax.plot(x_line, y_line + ci, 'r--', label='95% CI')
+		ax.plot(x_line, y_line - ci, 'r--')
+
+		# Annotate points outside the CI
+		for i in range(len(df_copy)):
+			if abs(residuals[i]) > ci:
+				ax.annotate(df_copy["ISO3"].iloc[i],
+							(x_vals[i], y_vals[i]),
+							fontsize=8,
+							alpha=0.8)
+
+		# Annotate statistics
+		ax.text(
+			0.05, 0.95,
+			f"$R^2$ = {r2:.2f}\n"
+			f"RMSE = {rmse:.2f}\n"
+			f"NRMSE = {nrmse:.2%}\n"
+			f"MAE = {mae:.2f}\n"
+			f"MAPE = {mape:.2f}%\n"
+			f"sMAPE = {smape:.2f}%",
+			transform=ax.transAxes,
+			fontsize=9,
+			verticalalignment='top',
+			bbox=dict(facecolor='white', alpha=0.8)
 		)
 
-		# Set the plot title to reflect any log transformation
-		plt.title(f"{x_label} vs {y_label}")
-		
-		# Annotate the R² value on the plot (using relative axis coordinates)
-		ax = g.axes[0, 0]
-		# Override the axis labels to be the original variable names
+		ax.legend()
 		ax.set_xlabel(x_col)
 		ax.set_ylabel(y_col)
-		ax.text(0.05, 0.95, f"$R^2$ = {r2:.2f}",
-				transform=ax.transAxes, fontsize=10, verticalalignment='top')
-
-		# Annotate each point with the ISO3 code
-		for i, row in df_copy.iterrows():
-			ax.text(
-				row["x_plot"], 
-				row["y_plot"], 
-				row["ISO3"],
-				fontsize=8,
-				alpha=0.8
-			)
-
+		plt.tight_layout()
 		plt.show()
 
 	## Algorithm Methods ##
 
-	def gravity_model(self, threshold_percentile=100, verbose=False):
+	def gravity_model(self, distance='pairwise_haversine', threshold_percentile=100, trade_tariff_path=None, year=None, mode='exponential', tariff_weight_factor=1.0, alpha=1.0, a=2.0, b=10, c=0.3, verbose=False):
 		if verbose:
 			if threshold_percentile < 100:
 				print(f"Running Gravity Model with thresholding at {threshold_percentile}% of possible edges...")
@@ -306,8 +370,11 @@ class FlowNetwork:
 		in_coords_array = np.array(self.in_coords)  # shape (I, 2)
 		out_coords_array = np.array(self.out_coords)  # shape (O, 2)
 
-		distances = self._pairwise_haversine(out_coords_array, in_coords_array)  # shape (O, I)
-		distances[distances == 0] = np.nan  # prevent divide-by-zero
+		if distance == 'pairwise_haversine':
+			distances = self._pairwise_haversine(out_coords_array, in_coords_array)  # shape (O, I)
+			distances[distances == 0] = np.nan  # prevent divide-by-zero
+		elif distance == 'tariff':
+			distances = self._distance_tariff(trade_tariff_path, year, tariff_weight_factor, mode, alpha, a, b, c, verbose)
 
 		# Calculate gravity matrix g = G * m_o * m_i / d
 		gravity_matrix = np.outer(outflow_values, inflow_values) / distances  # shape (O, I)
@@ -425,7 +492,6 @@ class FlowNetwork:
 		
 		# find all non-zero entries in the flow matrix
 		out_idx, in_idx = np.nonzero(self.flow)
-
 		# assemble records
 		records = []
 		for o, i in zip(out_idx, in_idx):
@@ -462,6 +528,7 @@ class FlowNetwork:
 		if json_path:
 			trade_df = self._group_iso3(json_path, trade_df)
 		self.bilateral_df = trade_df.copy()
+		return trade_df
 
 	def validate_bilateral(self, bilateral_csv_path, year, x_log=False, y_log=False, rm_outliers=False):
 
@@ -492,8 +559,9 @@ class FlowNetwork:
 			y_log=y_log,
 			rm_outliers=rm_outliers
 		)
+		return val_df
 
-	def plot_network_map(self, caption=None, num_edges=None, vmin=None, vmax=None, color='coolwarm', levels=6, edge_thickness=1, edge_alpha=0.5, edge_color='gray'):
+	def plot_network_map(self, caption=None, num_edges=None, vmin=None, vmax=None, extend_max=False, extend_min=False, color='coolwarm', levels=6, edge_thickness=1, edge_alpha=0.5, edge_color='gray'):
 		"""
 		Plot the flow network over a variable background map.
 
@@ -509,7 +577,7 @@ class FlowNetwork:
 		out_coords = self.out_coords
 
 		self.ds['netflow'] = self.ds[self.outflow_var] - self.ds[self.inflow_var]
-		ax = ssm.plot_map('netflow', self.ds, levels=levels, vmin=vmin, vmax=vmax, color=color, show=False, remove_ata=True)
+		ax = ssm.plot_map('netflow', self.ds, levels=levels, vmin=vmin, vmax=vmax, extend_max=extend_max, extend_min=extend_min, color=color, out_bound=False, show=False, remove_ata=True)
 
 		# Count non-zero edges
 		non_zero_edges = np.sum(edges > 0)
