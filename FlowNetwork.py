@@ -8,11 +8,12 @@ import json
 import importlib.resources as pkg_resources
 import os
 import sesame as ssm
+import networkx as nx
 
 class FlowNetwork:
 	def __init__(self, dataset, outflow_var, inflow_var, node_thresh=0, time=None, verbose=False):
 		if isinstance(dataset, str):
-			self.ds = xr.load_dataset(dataset)
+			self.ds = xr.open_dataset(dataset)
 		elif isinstance(dataset, xr.Dataset):
 			self.ds = dataset
 		else:
@@ -108,6 +109,77 @@ class FlowNetwork:
 			
 		if verbose:
 			print("✓ Data saved successfully")
+
+	# def save_to_netcdf(self, filename="gravity_model_output.nc"):
+
+	# 	# Get coords
+	# 	out_coords_array = np.array(self.out_coords)  # (O, 2) - lat, lon
+	# 	in_coords_array = np.array(self.in_coords)    # (I, 2)
+
+	# 	# Get lat/lon separately for easier indexing
+	# 	out_lat, out_lon = out_coords_array[:, 0], out_coords_array[:, 1]
+	# 	in_lat, in_lon = in_coords_array[:, 0], in_coords_array[:, 1]
+
+	# 	# Save flow matrix directly
+	# 	flow_matrix = self.flow  # shape (O, I)
+
+	# 	ds = xr.Dataset(
+	# 		data_vars={
+	# 			"flow": (["origin", "destination"], flow_matrix),
+	# 		},
+	# 		coords={
+	# 			"origin_lat": ("origin", out_lat),
+	# 			"origin_lon": ("origin", out_lon),
+	# 			"destination_lat": ("destination", in_lat),
+	# 			"destination_lon": ("destination", in_lon),
+	# 		},
+	# 		attrs={
+	# 			"description": "Full gravity model flow matrix (O × I)",
+	# 			"flow_units": self.ds[self.inflow_var].attrs.get("units", "tonne per grid"),
+	# 		}
+	# 	)
+
+	# 	ds.to_netcdf(filename)
+	# 	print(f"NetCDF file saved to: {filename}")
+
+	def save_to_netcdf(self, filename="gravity_model_output.nc"):
+		# Get coords
+		out_coords_array = np.array(self.out_coords)  # (O, 2) - lat, lon
+		in_coords_array = np.array(self.in_coords)    # (I, 2)
+
+		out_lat, out_lon = out_coords_array[:, 0], out_coords_array[:, 1]
+		in_lat, in_lon = in_coords_array[:, 0], in_coords_array[:, 1]
+
+		# Flow matrix
+		flow_matrix = self.flow  # shape (O, I)
+
+		# Total outflow per origin node (sum across destinations)
+		outflow = flow_matrix.sum(axis=1)  # shape (origin,)
+
+		# Total inflow per destination node (sum across origins)
+		inflow = flow_matrix.sum(axis=0)   # shape (destination,)
+
+		# Build xarray Dataset
+		ds = xr.Dataset(
+			data_vars={
+				"flow": (["origin", "destination"], flow_matrix),
+				"outflow": (["origin"], outflow),
+				"inflow": (["destination"], inflow),
+			},
+			coords={
+				"origin_lat": ("origin", out_lat),
+				"origin_lon": ("origin", out_lon),
+				"destination_lat": ("destination", in_lat),
+				"destination_lon": ("destination", in_lon),
+			},
+			attrs={
+				"description": "Gravity model flow matrix with inflow/outflow totals",
+				"flow_units": self.ds[self.inflow_var].attrs.get("units", "tonne per grid"),
+			}
+		)
+
+		ds.to_netcdf(filename)
+		print(f"NetCDF file saved to: {filename}")
 
 	@classmethod
 	def load_data(cls, input_path, verbose=False):
@@ -246,6 +318,7 @@ class FlowNetwork:
 			adjusted_distances = distances * (1 + tariff_weight_factor * tariff_matrix)
 		elif mode == 'power':
 			adjusted_distances = distances * (1 + tariff_matrix) ** alpha
+			print('done!')
 		elif mode == 'sigmoid':
 			scale = 1 + a / (1 + np.exp(-b * (tariff_matrix - c)))
 			adjusted_distances = distances * scale
@@ -261,24 +334,20 @@ class FlowNetwork:
 
 		return adjusted_distances
 
-	def _limplot(self, df, x_col, y_col, x_log=False, y_log=False, rm_outliers=False):
+	def _limplot(self, df, x_col, y_col, x_log=False, y_log=False, rm_outliers=False, title="Recorded vs Modelled Trade", x_label="Recorded Trade", y_label="Modelled Trade", xmax=None, ymax=None, fontsize=12):
 		df_copy = df.dropna(subset=[x_col, y_col, "ISO3"]).copy()
 
 		if x_log:
 			df_copy = df_copy[df_copy[x_col] > 0]
 			df_copy["x_plot"] = np.log10(df_copy[x_col])
-			x_label = f"log10({x_col})"
 		else:
 			df_copy["x_plot"] = df_copy[x_col]
-			x_label = x_col
 
 		if y_log:
 			df_copy = df_copy[df_copy[y_col] > 0]
 			df_copy["y_plot"] = np.log10(df_copy[y_col])
-			y_label = f"log10({y_col})"
 		else:
 			df_copy["y_plot"] = df_copy[y_col]
-			y_label = y_col
 
 		if rm_outliers:
 			Q1_x, Q3_x = df_copy["x_plot"].quantile([0.25, 0.75])
@@ -319,19 +388,19 @@ class FlowNetwork:
 		y_line = x_line
 
 		# Plot
-		fig, ax = plt.subplots(figsize=(7, 6))
+		fig, ax = plt.subplots(figsize=(6, 6))
 		ax.scatter(x_vals, y_vals, alpha=0.6, s=25)
 		ax.plot(x_line, y_line, 'b--', label='1-to-1 line')
-		ax.plot(x_line, y_line + ci, 'r--', label='95% CI')
+		ax.plot(x_line, y_line + ci, 'r--', label='95% Error Band')
 		ax.plot(x_line, y_line - ci, 'r--')
 
 		# Annotate points outside the CI
-		for i in range(len(df_copy)):
-			if abs(residuals[i]) > ci:
-				ax.annotate(df_copy["ISO3"].iloc[i],
-							(x_vals[i], y_vals[i]),
-							fontsize=8,
-							alpha=0.8)
+		# for i in range(len(df_copy)):
+		# 	if abs(residuals[i]) > ci:
+		# 		ax.annotate(df_copy["ISO3"].iloc[i],
+		# 					(x_vals[i], y_vals[i]),
+		# 					fontsize=8,
+		# 					alpha=0.8)
 
 		# Annotate statistics
 		ax.text(
@@ -349,10 +418,31 @@ class FlowNetwork:
 		)
 
 		ax.legend()
-		ax.set_xlabel(x_col)
-		ax.set_ylabel(y_col)
+		ax.set_title(title, fontsize=fontsize+2, pad=5)
+		ax.set_xlabel(x_label, fontsize=fontsize)
+		ax.set_ylabel(y_label, fontsize=fontsize)
+		ax.tick_params(axis='x', labelsize=fontsize)
+		ax.tick_params(axis='y', labelsize=fontsize)
+		if xmax is not None:
+			ax.set_xlim(right=xmax)
+		if ymax is not None:
+			ax.set_ylim(top=ymax)
 		plt.tight_layout()
 		plt.show()
+		
+		# Pack up the stats
+		stats = {
+			"R2":     r2,
+			"RMSE":   rmse,
+			"NRMSE":  nrmse,
+			"MAE":    mae,
+			"MAPE":   mape,
+			"sMAPE":  smape,
+			"n_points": len(x_vals)
+		}
+
+		
+		return stats
 
 	## Algorithm Methods ##
 
@@ -429,6 +519,69 @@ class FlowNetwork:
 		self.ensemble = gravity_matrix
 		if verbose:
 			print("Gravity Model Complete. Ensemble Generated.")
+
+	# def gravity_model(self,
+	# 				distance='tariff',
+	# 				threshold_percentile=100,
+	# 				year=None,
+	# 				# distance‐tariff kwargs
+	# 				trade_tariff_path=None,
+	# 				mode='exponential',
+	# 				tariff_weight_factor=1.0,
+	# 				alpha=1.0,
+	# 				a=2.0, b=10.0, c=0.3,
+	# 				# gravity‐kernel params
+	# 				theta=1.0, phi=1.0, beta=1.0, G0=None,
+	# 				verbose=False):
+	# 	"""
+	# 	Compute ensemble F_ij = G0 * S_i^theta * T_j^phi / (d_ij')^beta,
+	# 	where d_ij' comes from _distance_tariff if distance='tariff',
+	# 	passing along (mode, tariff_weight_factor, alpha, a, b, c).
+	# 	If G0 is None, it auto‐scales so sum(F)=total_flow.
+	# 	"""
+	# 	# 1) source/sink masses
+	# 	S = self.df.loc[self.out_coords, self.outflow_var].values  # (O,)
+	# 	T = self.df.loc[self.in_coords,  self.inflow_var].values  # (I,)
+
+	# 	# 2) compute distances
+	# 	pts_o = np.array(self.out_coords)
+	# 	pts_i = np.array(self.in_coords)
+	# 	if distance == 'pairwise_haversine':
+	# 		d = self._pairwise_haversine(pts_o, pts_i)
+	# 		d[d == 0] = np.nan
+	# 	else:
+	# 		d = self._distance_tariff(
+	# 			trade_tariff_path, year,
+	# 			tariff_weight_factor=tariff_weight_factor,
+	# 			mode=mode,
+	# 			alpha=alpha,
+	# 			a=a, b=b, c=c,
+	# 			verbose=verbose
+	# 		)
+
+	# 	# 3) raw kernel with exponents
+	# 	num = np.outer(S**theta, T**phi)    # (O,I)
+	# 	den = np.power(d, beta)             # (O,I)
+	# 	m   = np.nan_to_num(num / den)
+
+	# 	# 4) auto‐calibrate G0 if needed
+	# 	if G0 is None:
+	# 		total = getattr(self, 'total_flow', S.sum())
+	# 		sum_m = m.sum()
+	# 		G0 = total/sum_m if sum_m>0 else 1.0
+	# 	if verbose:
+	# 		print(f"→ Using G0={G0:.3g}, θ={theta}, φ={phi}, β={beta}, α={alpha}")
+
+	# 	# 5) build ensemble and threshold
+	# 	F = G0 * m
+	# 	if threshold_percentile < 100:
+	# 		mask = F >= np.percentile(F[F>0], 100-threshold_percentile)
+	# 		F = F * mask
+
+	# 	self.ensemble = F
+	# 	if verbose:
+	# 		nz = int((F>0).sum())
+	# 		print(f"Ensemble built with {nz} edges.")
 
 	def ipf_flows(self, max_iters=100, tol=1e-6, verbose=False):
 		"""
@@ -516,7 +669,7 @@ class FlowNetwork:
 			# Now aggregate total_flow by (exp_region, imp_region, year)
 			grouped_df = (
 				trade_df
-				.groupby(['exp_ISO3', 'imp_ISO3', 'year'], as_index=False)['total_flow']
+				.groupby(['exp_ISO3', 'imp_ISO3'], as_index=False)['total_flow']
 				.sum()
 				.rename(columns={'total_flow': 'tonnes'})
 			)
@@ -527,18 +680,18 @@ class FlowNetwork:
 		trade_df = (edge_df.groupby(["exporter", "importer", "year"], as_index=False)["flow"].sum().rename(columns={"flow": "total_flow"}))
 		if json_path:
 			trade_df = self._group_iso3(json_path, trade_df)
+			trade_df["year"] = year
 		self.bilateral_df = trade_df.copy()
-		return trade_df
+		return self.bilateral_df
 
-	def validate_bilateral(self, bilateral_csv_path, year, x_log=False, y_log=False, rm_outliers=False):
-
+	def validate_bilateral(self, bilateral_csv_path, year, column='tonnes', x_log=False, y_log=False, rm_outliers=False, title="Recorded vs Modelled Trade", x_label="Recorded", y_label="Modelled", xmax=None, ymax=None, fontsize=12):
 		raw_df = pd.read_csv(bilateral_csv_path)
 		if year:
 			raw_df = raw_df[raw_df["year"] == year]
 		
 		pred_df = self.bilateral_df
 		# 1) filter to the correct year
-		raw_y  = raw_df[raw_df.year == year ].copy().rename(columns={'tonnes':'raw_tonnes'})
+		raw_y  = raw_df[raw_df.year == year ].copy().rename(columns={column:'raw_tonnes'})
 		pred_y = pred_df[pred_df.year == year].copy().rename(columns={'tonnes':'pred_tonnes'})
 
 		# 2) merge on exp_ISO3, imp_ISO3, year
@@ -551,15 +704,361 @@ class FlowNetwork:
 		val_df['ISO3'] = val_df['exp_ISO3'] + '→' + val_df['imp_ISO3']
 
 		# 5) plot
-		self._limplot(
+		metrics = self._limplot(
 			val_df,
 			x_col='raw_tonnes',
 			y_col='pred_tonnes',
 			x_log=x_log,
 			y_log=y_log,
-			rm_outliers=rm_outliers
+			rm_outliers=rm_outliers,
+			title=title, 
+			x_label=x_label, 
+			y_label=y_label,
+			xmax=xmax, 
+			ymax=ymax,
+			fontsize=fontsize
 		)
-		return val_df
+		return val_df, metrics
+
+	# def flow_to_xarray(self):
+	# 	"""
+	# 	Convert the modeled flow matrix self.flow into an xarray.Dataset
+	# 	with two DataArrays: 'predicted_outflow' and 'predicted_inflow',
+	# 	on the same (lat, lon) grid as self.ds.
+	# 	"""
+	# 	# 1) extract the lat/lon coordinate arrays
+	# 	lats = self.ds['lat'].values
+	# 	lons = self.ds['lon'].values
+	# 	nlat, nlon = len(lats), len(lons)
+
+	# 	# 2) compute per-node sums
+	# 	#    row sums = outflow from each out_coord
+	# 	out_sums = self.flow.sum(axis=1)  # length = len(self.out_coords)
+	# 	#    col sums = inflow to each in_coord
+	# 	in_sums  = self.flow.sum(axis=0)  # length = len(self.in_coords)
+
+	# 	# 3) build empty 2D arrays
+	# 	arr_out = np.zeros((nlat, nlon), dtype=float)
+	# 	arr_in  = np.zeros((nlat, nlon), dtype=float)
+
+	# 	# 4) fill them by mapping each coord -> array index
+	# 	#    build lookup from lat->index, lon->index
+	# 	lat_to_i = {lat: i for i, lat in enumerate(lats)}
+	# 	lon_to_j = {lon: j for j, lon in enumerate(lons)}
+
+	# 	# fill outflow
+	# 	for k, (lat, lon) in enumerate(self.out_coords):
+	# 		i = lat_to_i.get(lat)
+	# 		j = lon_to_j.get(lon)
+	# 		if i is not None and j is not None:
+	# 			arr_out[i, j] = out_sums[k]
+
+	# 	# fill inflow
+	# 	for k, (lat, lon) in enumerate(self.in_coords):
+	# 		i = lat_to_i.get(lat)
+	# 		j = lon_to_j.get(lon)
+	# 		if i is not None and j is not None:
+	# 			arr_in[i, j] = in_sums[k]
+
+	# 	# 5) wrap into an xarray.Dataset
+	# 	ds_pred = xr.Dataset(
+	# 		{
+	# 			"exporter": (("lat", "lon"), arr_out),
+	# 			"importer":  (("lat", "lon"), arr_in),
+	# 		},
+	# 		coords={
+	# 			"lat": lats,
+	# 			"lon": lons
+	# 		}
+	# 	)
+
+	# 	# copy units if available
+	# 	ds_pred["exporter"].attrs["units"] = self.ds[self.outflow_var].attrs.get("units", "")
+	# 	ds_pred["importer"].attrs["units"]  = self.ds[self.inflow_var].attrs.get("units", "")
+
+	# 	print(ds_pred)
+
+	# 	return ds_pred
+
+	# def cache_cell_fractions(self, year):
+	# 	"""
+	# 	Build and store a small DataFrame self.cell_frac_df containing only the
+	# 	country fractions at the grid cells we actually use (out_coords + in_coords).
+	# 	"""
+	# 	import pandas as pd
+
+	# 	# 1) slice the xarray country‐fraction dataset at this year
+	# 	ts = np.datetime64(f"{year}-01-01")
+	# 	ds_slice = self.ds_country.sel(time=ts)  # dims: (ISO3, lat, lon)
+
+	# 	# 2) convert it to a DataArray with an explicit ISO3 dimension
+	# 	da = ds_slice.to_array(dim="ISO3")       # dims: (ISO3, lat, lon)
+
+	# 	# 3) collect only the lat/lon points we need
+	# 	pts = pd.DataFrame(self.out_coords + self.in_coords, columns=["lat","lon"])\
+	# 			.drop_duplicates().reset_index(drop=True)
+	# 	# now create an xarray Dataset for vectorized .sel
+	# 	pts_xr = xr.Dataset({
+	# 		"lat": (("points",), pts["lat"].values),
+	# 		"lon": (("points",), pts["lon"].values)
+	# 	})
+
+	# 	# 4) one single sel to get only ISO3 × points
+	# 	small = da.sel(lat=pts_xr["lat"], lon=pts_xr["lon"], method="nearest")
+	# 	# dims: (ISO3, points)
+
+	# 	# 5) now melt that small array into a DataFrame
+	# 	# name the DataArray so to_dataframe will have the right column
+	# 	small.name = "frac"
+	# 	small_df = small.to_dataframe().reset_index()  
+	# 	# columns: ['ISO3','points','lat','lon','frac']
+
+	# 	# 6) keep only non-zero fractions
+	# 	self.cell_frac_df = small_df.loc[small_df["frac"] > 0, ["lat","lon","ISO3","frac"]]
+	# 	# and remember which year it corresponds to
+	# 	self._cache_year = year
+
+	# def bilateral_flow(self, year, json_path=None):
+	# 	# ensure cache for this year
+	# 	if getattr(self, "_cache_year", None) != year:
+	# 		self.cache_cell_fractions(year)
+
+	# 	# build the edge list, attach lat/lon (same as before)
+	# 	out_idx, in_idx = np.nonzero(self.flow)
+	# 	edges = pd.DataFrame({
+	# 		"out_i": out_idx,
+	# 		"in_j":  in_idx,
+	# 		"flow":  self.flow[out_idx, in_idx]
+	# 	})
+	# 	out_df = pd.DataFrame(self.out_coords, columns=["lat","lon"]).reset_index().rename(columns={"index":"out_i"})
+	# 	in_df  = pd.DataFrame(self.in_coords,  columns=["lat","lon"]).reset_index().rename(columns={"index":"in_j"})
+	# 	edges = edges.merge(out_df, on="out_i").rename(columns={"lat":"lat_out","lon":"lon_out"})
+	# 	edges = edges.merge(in_df,  on="in_j").rename(columns={"lat":"lat_in","lon":"lon_in"})
+
+	# 	# merge exporter fractions
+	# 	exp = self.cell_frac_df.rename(columns={"lat":"lat_out","lon":"lon_out","ISO3":"exporter","frac":"exp_frac"})
+	# 	edges = edges.merge(exp, on=["lat_out","lon_out"], how="left")
+
+	# 	# merge importer fractions
+	# 	imp = self.cell_frac_df.rename(columns={"lat":"lat_in","lon":"lon_in","ISO3":"importer","frac":"imp_frac"})
+	# 	edges = edges.merge(imp, on=["lat_in","lon_in"], how="left")
+
+	# 	# weight flows
+	# 	edges["flow"] = edges["flow"] * edges["exp_frac"] * edges["imp_frac"]
+	# 	edges["year"] = year
+	# 	# aggregate to country pairs
+	# 	if json_path:
+	# 		with open(json_path) as f:
+	# 			mapping = json.load(f)
+	# 		edges["exp_ISO3"] = edges["exporter"].map(mapping)
+	# 		edges["imp_ISO3"] = edges["importer"].map(mapping)
+	# 		out = (edges
+	# 				.groupby(["exp_ISO3","imp_ISO3","year"], as_index=False)["flow"]
+	# 				.sum()
+	# 				.rename(columns={"flow":"total_flow"}))
+	# 	else:
+	# 		out = (edges
+	# 				.groupby(["exporter","importer","year"], as_index=False)["flow"]
+	# 				.sum()
+	# 				.rename(columns={"flow":"total_flow"}))
+	# 	# assign and return
+	# 	self.bilateral_df = out
+	# 	return self.bilateral_df
+
+	# def validate_bilateral(self, bilateral_csv_path, year, column='tonnes', x_log=False, y_log=False, rm_outliers=False):
+
+	# 	raw_df = pd.read_csv(bilateral_csv_path)
+	# 	if year:
+	# 		raw_df = raw_df[raw_df["year"] == year]
+		
+	# 	pred_df = self.bilateral_df
+	# 	# 1) filter to the correct year
+	# 	raw_y  = raw_df[raw_df.year == year ].copy().rename(columns={column:'raw_tonnes'})
+	# 	pred_y = pred_df[pred_df.year == year].copy().rename(columns={'total_flow':'pred_tonnes'})
+
+	# 	# 2) merge on exp_ISO3, imp_ISO3, year
+	# 	val_df = pd.merge(
+	# 		raw_y, pred_y,
+	# 		on=['exp_ISO3','imp_ISO3','year'],
+	# 		how='inner'
+	# 	)
+	# 	# 3) label for annotation
+	# 	val_df['ISO3'] = val_df['exp_ISO3'] + '→' + val_df['imp_ISO3']
+
+	# 	# 5) plot
+	# 	metrics = self._limplot(
+	# 		val_df,
+	# 		x_col='raw_tonnes',
+	# 		y_col='pred_tonnes',
+	# 		x_log=x_log,
+	# 		y_log=y_log,
+	# 		rm_outliers=rm_outliers
+	# 	)
+	# 	return val_df, metrics
+
+	def plot_isci(self,
+				isci_col='ISCI', 
+				country_col='ISO3',
+				title="Iron System Centrality Index",
+				xlabel='Eigenvector Centrality',
+				figsize=(8, 10),
+				dpi=300,
+				font_size=10,
+				bar_color='Orange'):
+
+		# sort so largest is at top
+		df = self.isci_df
+		df_sorted = df.sort_values(isci_col, ascending=False)
+		
+		fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+		ax.barh(df_sorted[country_col], df_sorted[isci_col], color=bar_color, edgecolor='none')
+		ax.invert_yaxis()
+		
+		# labels & title
+		ax.set_xlabel(xlabel, fontsize=font_size+2)
+		ax.set_ylabel('')
+		ax.set_title(title, fontsize=font_size+4, pad=15)
+		
+		# grid styling
+		ax.xaxis.grid(True, linestyle='--', linewidth=0.5, alpha=0.7)
+		ax.set_axisbelow(True)
+		
+		# remove default margins
+		ax.margins(y=0.01)
+		
+		# tick styling
+		ax.tick_params(axis='x', labelsize=font_size)
+		ax.tick_params(axis='y', labelsize=font_size)
+		
+		fig.tight_layout()
+		return fig, ax
+
+	def compute_ISCI(self, method='eigenvector', plot=False):
+		"""
+		Build a country-level directed graph from self.bilateral_df (for the given year)
+		and compute the Iron System Centrality Index (ISCI) via the specified
+		network-centrality method.
+		
+		method: one of 'eigenvector', 'pagerank', 'betweenness', 'closeness'
+		"""
+		df = self.bilateral_df
+
+		# build graph
+		G = nx.DiGraph()
+		for _, row in df.iterrows():
+			G.add_edge(row['exp_ISO3'], row['imp_ISO3'],
+						weight=row['tonnes'])
+
+		# choose centrality
+		if method == 'eigenvector':
+			C = nx.eigenvector_centrality_numpy(G, weight='weight')
+		elif method == 'pagerank':
+			C = nx.pagerank(G, weight='weight')
+		elif method == 'betweenness':
+			C = nx.betweenness_centrality(G, weight='weight')
+		elif method == 'closeness':
+			C = nx.closeness_centrality(G, distance=lambda u, v, d: 1.0/d.get('weight',1.0))
+		else:
+			raise ValueError(f"Unknown centrality method {method}")
+
+		# record as DataFrame on the instance
+		self.isci_df = (
+			pd.DataFrame.from_dict(C, orient='index', columns=['ISCI'])
+				.reset_index()
+				.rename(columns={'index':'ISO3'})
+		)
+		if plot:
+			# no extra `self` positional argument!
+			self.plot_isci(
+				isci_col='ISCI',
+				country_col='ISO3',
+				title="Iron System Centrality Index",
+				xlabel=f"{method.capitalize()} Centrality",
+				figsize=(8, 10),
+				dpi=300,
+				font_size=12,
+				bar_color='orange'
+			)
+
+		return self.isci_df.sort_values('ISCI', ascending=False)
+
+	def compute_cell_centrality(self,
+								method='eigenvector',
+								as_xarray=False,
+								max_iter=500,
+								tol=1e-6,
+								fill_value=np.nan):
+		"""
+		Compute grid‐cell centrality (ISCI) on the directed cell‐graph.
+		
+		Parameters
+		----------
+		method : str
+			One of 'eigenvector','pagerank','betweenness','closeness'.
+		as_xarray : bool
+			If False (default), returns a DataFrame with columns
+			['lat','lon','centrality'] for each cell that has flow.
+			If True, returns an xarray.Dataset with dims (lat, lon)
+			matching self.ds, filling non‐active cells with fill_value.
+		max_iter, tol : for the power‐method eigenvector solver.
+		fill_value : value for inactive cells in the xarray output.
+		
+		Returns
+		-------
+		pandas.DataFrame or xarray.Dataset
+		"""
+		# 1) Build directed graph of nonzero flows between cells
+		G = nx.DiGraph()
+		O, I = self.flow.shape
+		for oi, ji in zip(*np.nonzero(self.flow)):
+			u = tuple(self.out_coords[oi])
+			v = tuple(self.in_coords[ji])
+			G.add_edge(u, v, weight=self.flow[oi, ji])
+
+		# 2) Compute centrality
+		if method == 'eigenvector':
+			C = nx.eigenvector_centrality(
+				G, weight='weight', max_iter=max_iter, tol=tol
+			)
+		elif method == 'pagerank':
+			C = nx.pagerank(G, weight='weight')
+		elif method == 'betweenness':
+			C = nx.betweenness_centrality(G, weight='weight')
+		elif method == 'closeness':
+			C = nx.closeness_centrality(
+				G, distance=lambda u, v, d: 1.0 / d.get('weight', 1.0)
+			)
+		else:
+			raise ValueError(f"Unknown centrality method {method!r}")
+
+		# 3) Unpack to DataFrame
+		df = pd.DataFrame([
+			{'lat': coord[0], 'lon': coord[1], 'centrality': score}
+			for coord, score in C.items()
+		]).sort_values('centrality', ascending=False).reset_index(drop=True)
+
+		if not as_xarray:
+			return df
+
+		# 4) Paint to full grid
+		lats = self.ds['lat'].values
+		lons = self.ds['lon'].values
+		arr  = np.full((lats.size, lons.size), fill_value, dtype=float)
+
+		# nearest‐neighbor mapping from (lat,lon)→index
+		for _, row in df.iterrows():
+			i = np.abs(lats - row.lat).argmin()
+			j = np.abs(lons - row.lon).argmin()
+			arr[i, j] = row.centrality
+
+		da = xr.DataArray(
+			arr,
+			coords={'lat': lats, 'lon': lons},
+			dims=['lat', 'lon'],
+			name=f'cell_centrality_{method}'
+		)
+		return xr.Dataset({da.name: da})
+
 
 	def plot_network_map(self, caption=None, num_edges=None, vmin=None, vmax=None, extend_max=False, extend_min=False, color='coolwarm', levels=6, edge_thickness=1, edge_alpha=0.5, edge_color='gray'):
 		"""
@@ -590,7 +1089,6 @@ class FlowNetwork:
 
 		# Convert flat indices to 2D indices
 		out_idxs, in_idxs = np.unravel_index(top_indices, edges.shape)
-
 		edge_scale = edge_thickness / edges.max()
 
 		# Plot only the strongest edges
